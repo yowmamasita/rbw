@@ -694,6 +694,7 @@ impl DecryptedCipher {
                 username,
                 totp,
                 uris,
+                passkeys,
                 ..
             } => {
                 let mut displayed = self.display_short(desc, clipboard);
@@ -714,6 +715,16 @@ impl DecryptedCipher {
                             clipboard,
                         );
                     }
+                }
+
+                for p in passkeys.iter().flatten() {
+                    let site = p.rp_id.as_deref().unwrap_or("(unknown site)");
+                    let passkey = p.user_name.as_deref().map_or_else(
+                        || site.to_string(),
+                        |user| format!("{site} ({user})"),
+                    );
+                    displayed |=
+                        display_field("Passkey", Some(&passkey), clipboard);
                 }
 
                 for field in &self.fields {
@@ -1027,6 +1038,8 @@ enum DecryptedData {
         password: Option<String>,
         totp: Option<String>,
         uris: Option<Vec<DecryptedUri>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        passkeys: Option<Vec<DecryptedPasskey>>,
     },
     Card {
         cardholder_name: Option<String>,
@@ -1555,6 +1568,58 @@ pub fn code(
     Ok(())
 }
 
+pub fn passkey(
+    needle: Needle,
+    user: Option<&str>,
+    folder: Option<&str>,
+    ignore_case: bool,
+    origin: &str,
+    challenge: &str,
+) -> anyhow::Result<()> {
+    unlock()?;
+
+    let db = load_db()?;
+
+    let desc = format!(
+        "{}{}",
+        user.map_or_else(String::new, |s| format!("{s}@")),
+        needle
+    );
+
+    let (_, decrypted) =
+        find_entry(&db, needle, user, folder, ignore_case)
+            .with_context(|| format!("couldn't find entry for '{desc}'"))?;
+
+    let DecryptedData::Login { passkeys, .. } = decrypted.data else {
+        return Err(anyhow::anyhow!("not a login entry"));
+    };
+    // the official clients keep one passkey per login
+    let Some(p) = passkeys.and_then(|p| p.into_iter().next()) else {
+        return Err(anyhow::anyhow!("entry does not contain a passkey"));
+    };
+    let (Some(rp_id), Some(credential_id), Some(key_value)) =
+        (&p.rp_id, &p.credential_id, &p.key_value)
+    else {
+        return Err(anyhow::anyhow!(
+            "passkey is missing its site, id or key"
+        ));
+    };
+    let assertion = rbw::passkey::get_assertion(
+        &rbw::passkey::Passkey {
+            rp_id,
+            credential_id,
+            key_value,
+            user_handle: p.user_handle.as_deref(),
+            counter: p.counter.as_deref(),
+        },
+        origin,
+        challenge,
+    )?;
+    println!("{assertion}");
+
+    Ok(())
+}
+
 pub fn add(
     name: &str,
     username: Option<&str>,
@@ -1641,6 +1706,7 @@ pub fn add(
             password,
             uris,
             totp: None,
+            fido2_credentials: vec![],
         },
         notes.as_deref(),
         folder_id.as_deref(),
@@ -1736,6 +1802,7 @@ pub fn generate(
                 password: Some(password),
                 uris,
                 totp: None,
+                fido2_credentials: vec![],
             },
             None,
             folder_id.as_deref(),
@@ -1785,15 +1852,20 @@ pub fn edit(
             let (password, notes) = parse_editor(&contents);
             let password = password
                 .map(|password| {
-                    crate::actions::encrypt(
+                    crate::actions::encrypt_for_entry(
                         &password,
+                        entry.key.as_deref(),
                         entry.org_id.as_deref(),
                     )
                 })
                 .transpose()?;
             let notes = notes
                 .map(|notes| {
-                    crate::actions::encrypt(&notes, entry.org_id.as_deref())
+                    crate::actions::encrypt_for_entry(
+                        &notes,
+                        entry.key.as_deref(),
+                        entry.org_id.as_deref(),
+                    )
                 })
                 .transpose()?;
             let mut history = entry.history.clone();
@@ -1802,6 +1874,7 @@ pub fn edit(
                 password: entry_password,
                 uris: entry_uris,
                 totp: entry_totp,
+                fido2_credentials: entry_fido2_credentials,
             } = &entry.data
             else {
                 unreachable!();
@@ -1825,6 +1898,7 @@ pub fn edit(
                 password,
                 uris: entry_uris.clone(),
                 totp: entry_totp.clone(),
+                fido2_credentials: entry_fido2_credentials.clone(),
             };
             (data, entry.fields, notes, history)
         }
@@ -1842,7 +1916,11 @@ pub fn edit(
 
             let notes = notes
                 .map(|notes| {
-                    crate::actions::encrypt(&notes, entry.org_id.as_deref())
+                    crate::actions::encrypt_for_entry(
+                        &notes,
+                        entry.key.as_deref(),
+                        entry.org_id.as_deref(),
+                    )
                 })
                 .transpose()?;
 
@@ -1860,6 +1938,7 @@ pub fn edit(
         refresh_token,
         &entry.id,
         entry.org_id.as_deref(),
+        entry.key.as_deref(),
         &entry.name,
         &data,
         &fields,
@@ -2297,6 +2376,56 @@ fn decrypt_search_cipher(
     })
 }
 
+// The passkey fields the official clients store. keyValue (the private key) is
+// decrypted for signing but never printed.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[cfg_attr(test, derive(Eq, PartialEq))]
+struct DecryptedPasskey {
+    rp_id: Option<String>,
+    rp_name: Option<String>,
+    user_name: Option<String>,
+    user_display_name: Option<String>,
+    user_handle: Option<String>,
+    credential_id: Option<String>,
+    counter: Option<String>,
+    discoverable: Option<String>,
+    creation_date: Option<String>,
+    #[serde(skip)]
+    key_value: Option<String>,
+}
+
+fn decrypt_passkey(
+    cred: &serde_json::Value,
+    entry: &rbw::db::Entry,
+) -> DecryptedPasskey {
+    let field = |name: &str| {
+        let cipherstring = cred.get(name)?.as_str()?;
+        crate::actions::decrypt(
+            cipherstring,
+            entry.key.as_deref(),
+            entry.org_id.as_deref(),
+        )
+        .map_err(|e| log::warn!("failed to decrypt passkey {name}: {e}"))
+        .ok()
+    };
+    DecryptedPasskey {
+        rp_id: field("rpId"),
+        rp_name: field("rpName"),
+        user_name: field("userName"),
+        user_display_name: field("userDisplayName"),
+        user_handle: field("userHandle"),
+        credential_id: field("credentialId"),
+        counter: field("counter"),
+        discoverable: field("discoverable"),
+        // stored in plain text
+        creation_date: cred
+            .get("creationDate")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        key_value: field("keyValue"),
+    }
+}
+
 fn decrypt_cipher(entry: &rbw::db::Entry) -> anyhow::Result<DecryptedCipher> {
     // folder name should always be decrypted with the local key because
     // folders are local to a specific user's vault, not the organization
@@ -2382,7 +2511,14 @@ fn decrypt_cipher(entry: &rbw::db::Entry) -> anyhow::Result<DecryptedCipher> {
             password,
             totp,
             uris,
+            fido2_credentials,
         } => DecryptedData::Login {
+            passkeys: (!fido2_credentials.is_empty()).then(|| {
+                fido2_credentials
+                    .iter()
+                    .map(|cred| decrypt_passkey(cred, entry))
+                    .collect()
+            }),
             username: decrypt_field(
                 Field::Username,
                 username.as_deref(),
@@ -4151,6 +4287,7 @@ mod test {
                         })
                         .collect(),
                     totp: None,
+                    fido2_credentials: vec![],
                 },
                 fields: vec![],
                 notes: None,

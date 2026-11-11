@@ -109,12 +109,22 @@ pub fn encrypt(
     plaintext: &str,
     org_id: Option<&str>,
 ) -> anyhow::Result<String> {
+    encrypt_for_entry(plaintext, None, org_id)
+}
+
+/// Encrypts for an existing item, with the item's own key if it has one.
+pub fn encrypt_for_entry(
+    plaintext: &str,
+    entry_key: Option<&str>,
+    org_id: Option<&str>,
+) -> anyhow::Result<String> {
     let mut sock = connect()?;
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
         rbw::protocol::Action::Encrypt {
             plaintext: plaintext.to_string(),
             org_id: org_id.map(std::string::ToString::to_string),
+            entry_key: entry_key.map(std::string::ToString::to_string),
         },
     ))?;
 

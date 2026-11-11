@@ -693,6 +693,7 @@ pub async fn encrypt(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     plaintext: &str,
     org_id: Option<&str>,
+    entry_key: Option<&str>,
 ) -> anyhow::Result<()> {
     let state = state.lock().await;
     let Some(keys) = state.key(org_id) else {
@@ -700,8 +701,24 @@ pub async fn encrypt(
             "failed to find encryption keys in in-memory state"
         ));
     };
+    // an item with its own key must be encrypted with that key, as
+    // decrypt_cipher reads it
+    let entry_key = entry_key
+        .map(|entry_key| {
+            anyhow::Ok(rbw::locked::Keys::new(
+                rbw::cipherstring::CipherString::new(entry_key)
+                    .context(
+                        "failed to parse individual item encryption key",
+                    )?
+                    .decrypt_locked_symmetric(keys)
+                    .context(
+                        "failed to decrypt individual item encryption key",
+                    )?,
+            ))
+        })
+        .transpose()?;
     let cipherstring = rbw::cipherstring::CipherString::encrypt_symmetric(
-        keys,
+        entry_key.as_ref().unwrap_or(keys),
         plaintext.as_bytes(),
     )
     .context("failed to encrypt plaintext secret")?;

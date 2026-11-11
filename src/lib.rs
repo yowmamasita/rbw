@@ -10,6 +10,7 @@ pub mod error;
 pub mod identity;
 pub mod json;
 pub mod locked;
+pub mod passkey;
 pub mod pinentry;
 mod prelude;
 pub mod protocol;

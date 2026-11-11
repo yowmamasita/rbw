@@ -182,6 +182,9 @@ pub enum Action {
     Encrypt {
         plaintext: String,
         org_id: Option<String>,
+        // the item's own key, when it has one
+        #[serde(default)]
+        entry_key: Option<String>,
     },
     ClipboardStore {
         text: String,

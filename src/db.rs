@@ -121,6 +121,10 @@ pub enum EntryData {
         password: Option<String>,
         totp: Option<String>,
         uris: Vec<Uri>,
+        // Passkeys exactly as the server sent them (each field an EncString),
+        // so edits send them back untouched.
+        #[serde(default)]
+        fido2_credentials: Vec<serde_json::Value>,
     },
     Card {
         cardholder_name: Option<String>,

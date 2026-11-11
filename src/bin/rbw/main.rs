@@ -118,6 +118,23 @@ enum Opt {
     },
 
     #[command(
+        about = "Sign in to a site with the entry's passkey",
+        long_about = "Sign in to a site with the entry's passkey\n\n\
+            Prints the PublicKeyCredential JSON (binary values as base64url) \
+            that navigator.credentials.get() would return for the given \
+            origin and challenge. The origin must belong to the passkey's \
+            site."
+    )]
+    Passkey {
+        #[command(flatten)]
+        find_args: FindArgs,
+        #[arg(long, help = "Origin of the page, e.g. https://example.com")]
+        origin: String,
+        #[arg(long, help = "The request's challenge, base64url")]
+        challenge: String,
+    },
+
+    #[command(
         about = "Add a new password to the database",
         long_about = "Add a new password to the database\n\n\
             This command will open a text editor to enter \
@@ -254,6 +271,7 @@ impl Opt {
             Self::Get { .. } => "get".to_string(),
             Self::Search { .. } => "search".to_string(),
             Self::Code { .. } => "code".to_string(),
+            Self::Passkey { .. } => "passkey".to_string(),
             Self::Add { .. } => "add".to_string(),
             Self::Generate { .. } => "generate".to_string(),
             Self::Edit { .. } => "edit".to_string(),
@@ -379,6 +397,18 @@ fn main() {
             #[cfg(not(feature = "clipboard"))]
             false,
             find_args.ignorecase,
+        ),
+        Opt::Passkey {
+            find_args,
+            origin,
+            challenge,
+        } => commands::passkey(
+            find_args.needle,
+            find_args.user.as_deref(),
+            find_args.folder.as_deref(),
+            find_args.ignorecase,
+            &origin,
+            &challenge,
         ),
         Opt::Add {
             name,

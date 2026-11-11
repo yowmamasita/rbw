@@ -474,6 +474,10 @@ impl SyncResCipher {
                 username: login.username.clone(),
                 password: login.password.clone(),
                 totp: login.totp.clone(),
+                fido2_credentials: login
+                    .fido2_credentials
+                    .clone()
+                    .unwrap_or_default(),
                 uris: login.uris.as_ref().map_or_else(
                     std::vec::Vec::new,
                     |uris| {
@@ -591,6 +595,13 @@ struct CipherLogin {
     totp: Option<String>,
     #[serde(rename = "Uris", alias = "uris")]
     uris: Option<Vec<CipherLoginUri>>,
+    #[serde(
+        rename = "Fido2Credentials",
+        alias = "fido2Credentials",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    fido2_credentials: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -770,6 +781,10 @@ struct CiphersPutReq {
     folder_id: Option<String>,
     #[serde(rename = "organizationId")]
     organization_id: Option<String>,
+    // The item's own key. Left out, the server drops it and every field
+    // encrypted with it becomes unreadable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
     name: String,
     notes: Option<String>,
     login: Option<CipherLogin>,
@@ -813,6 +828,12 @@ struct FoldersPostReq {
 // https://github.com/bitwarden/server/blob/main/src/Core/Enums/BitwardenClient.cs
 const BITWARDEN_CLIENT: &str = "cli";
 
+// The server compares this with its own client versions, not rbw's: it
+// refuses to edit items holding passkeys (fido2Credentials) for clients older
+// than 2023.10.0 (Constants.Fido2KeyCipherMinimumVersion), since such clients
+// would drop them. rbw sends passkeys back untouched, so it qualifies.
+const BITWARDEN_CLIENT_VERSION: &str = "2023.10.0";
+
 // DeviceType.LinuxDesktop, as per Bitwarden API device types.
 const DEVICE_TYPE: u8 = 8;
 
@@ -840,7 +861,7 @@ impl Client {
         }
     }
 
-    async fn reqwest_client(&self) -> Result<reqwest::Client> {
+    fn default_headers() -> axum::http::HeaderMap {
         let mut default_headers = axum::http::HeaderMap::new();
         default_headers.insert(
             "Bitwarden-Client-Name",
@@ -848,7 +869,7 @@ impl Client {
         );
         default_headers.insert(
             "Bitwarden-Client-Version",
-            axum::http::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+            axum::http::HeaderValue::from_static(BITWARDEN_CLIENT_VERSION),
         );
         default_headers.append(
             "Device-Type",
@@ -857,6 +878,11 @@ impl Client {
             axum::http::HeaderValue::from_str(&DEVICE_TYPE.to_string())
                 .unwrap(),
         );
+        default_headers
+    }
+
+    async fn reqwest_client(&self) -> Result<reqwest::Client> {
+        let default_headers = Self::default_headers();
         let user_agent = format!(
             "{}/{}",
             env!("CARGO_PKG_NAME"),
@@ -1218,6 +1244,7 @@ impl Client {
                 password,
                 totp,
                 uris,
+                fido2_credentials,
             } => {
                 let uris = if uris.is_empty() {
                     None
@@ -1236,6 +1263,8 @@ impl Client {
                     password: password.clone(),
                     totp: totp.clone(),
                     uris,
+                    fido2_credentials: (!fido2_credentials.is_empty())
+                        .then(|| fido2_credentials.clone()),
                 });
             }
             crate::db::EntryData::Card {
@@ -1299,7 +1328,10 @@ impl Client {
             }
             crate::db::EntryData::SshKey { .. } => unreachable!(),
         }
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .default_headers(Self::default_headers())
+            .build()
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
         let res = client
             .post(self.api_url("/ciphers"))
             .header("Authorization", format!("Bearer {access_token}"))
@@ -1322,6 +1354,7 @@ impl Client {
         access_token: &str,
         id: &str,
         org_id: Option<&str>,
+        key: Option<&str>,
         name: &str,
         data: &crate::db::EntryData,
         fields: &[crate::db::Field],
@@ -1330,6 +1363,7 @@ impl Client {
         history: &[crate::db::HistoryEntry],
     ) -> Result<()> {
         let mut req = CiphersPutReq {
+            key: key.map(std::string::ToString::to_string),
             ty: match data {
                 crate::db::EntryData::Login { .. } => 1,
                 crate::db::EntryData::SecureNote => 2,
@@ -1368,6 +1402,7 @@ impl Client {
                 password,
                 totp,
                 uris,
+                fido2_credentials,
             } => {
                 let uris = if uris.is_empty() {
                     None
@@ -1386,6 +1421,8 @@ impl Client {
                     password: password.clone(),
                     totp: totp.clone(),
                     uris,
+                    fido2_credentials: (!fido2_credentials.is_empty())
+                        .then(|| fido2_credentials.clone()),
                 });
             }
             crate::db::EntryData::Card {
@@ -1449,7 +1486,10 @@ impl Client {
             }
             crate::db::EntryData::SshKey { .. } => unreachable!(),
         }
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .default_headers(Self::default_headers())
+            .build()
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
         let res = client
             .put(self.api_url(&format!("/ciphers/{id}")))
             .header("Authorization", format!("Bearer {access_token}"))
@@ -1468,7 +1508,10 @@ impl Client {
     }
 
     pub fn remove(&self, access_token: &str, id: &str) -> Result<()> {
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .default_headers(Self::default_headers())
+            .build()
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
         let res = client
             .delete(self.api_url(&format!("/ciphers/{id}")))
             .header("Authorization", format!("Bearer {access_token}"))
@@ -1489,7 +1532,10 @@ impl Client {
         &self,
         access_token: &str,
     ) -> Result<Vec<(String, String)>> {
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .default_headers(Self::default_headers())
+            .build()
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
         let res = client
             .get(self.api_url("/folders"))
             .header("Authorization", format!("Bearer {access_token}"))
@@ -1521,7 +1567,10 @@ impl Client {
         let req = FoldersPostReq {
             name: name.to_string(),
         };
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .default_headers(Self::default_headers())
+            .build()
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
         let res = client
             .post(self.api_url("/folders"))
             .header("Authorization", format!("Bearer {access_token}"))
@@ -1551,7 +1600,10 @@ impl Client {
             client_id: "cli".to_string(),
             refresh_token: refresh_token.to_string(),
         };
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .default_headers(Self::default_headers())
+            .build()
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
         let res = client
             .post(self.identity_url("/connect/token"))
             .form(&connect_req)

@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+## Added
+
+* Passkeys stored in the vault are kept on sync and shown by `rbw get`
+  (`--full` and `--raw`, without the private key).
+* `rbw passkey` signs a WebAuthn sign-in request with an entry's passkey
+  and prints the `PublicKeyCredential` JSON.
+
+## Fixed
+
+* `rbw edit` no longer fails with HTTP 400 on entries that hold a passkey,
+  and sends the passkey back unchanged.
+* `rbw edit` keeps an entry's individual encryption key and encrypts with it,
+  instead of making the entry unreadable (#364).
+
 ## [1.15.0] - 2025-12-31
 
 ## Added
